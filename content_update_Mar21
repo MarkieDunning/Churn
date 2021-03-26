@@ -1,0 +1,77 @@
+with site_completion_base as (
+select 
+s.user_id,
+s.current_snapshot_id,
+s.total_fields,
+r.total_site_blocks,
+r.total_standard_pages,
+s.completion_percentage,
+s.completion_rank,
+r.NUM_PROD_NAME,
+r.NUM_PROD_DESCRIPTION,
+r.NUM_PROD_IMAGE,
+r.NUM_ELEMENT_TEXT,
+r.NUM_ELEMENT_IMAGE,
+r.TOTAL_SITE_ITEMS,
+r.NUM_ELTEXT_TOTAL,
+r.NUM_ELIM_TOTAL,
+(r.num_prod_name+r.num_prod_description+r.num_prod_image+r.NUM_ELEMENT_TEXT+NUM_ELEMENT_IMAGE) as content_filled
+
+from WEEBLY_ML.EDITOR2.COMPLETION_SITE_DIMENSION s
+
+left join  WEEBLY_ML.EDITOR2.COMPLETION_SITE_ROLLUP r on s.CURRENT_SNAPSHOT_ID=r.CURRENT_SNAPSHOT_ID
+
+
+--where s.site_id in ('826747809231201628','181297875470189238')
+
+
+)
+
+,site_completion as (
+  
+  select
+p.updated_at,
+e.merchant_token,
+b.total_site_blocks,
+b.total_standard_pages,
+(ifnull(b.total_fields,0)-ifnull(total_site_items,0)) as total_content,
+b.content_filled,
+b.completion_percentage,
+b.completion_rank,
+(b.NUM_ELEMENT_TEXT+b.NUM_ELEMENT_IMAGE) as num_Elem_filled,
+(b.NUM_ELTEXT_TOTAL+b.NUM_ELIM_TOTAL) as num_elem_total,
+(ifnull(num_prod_description,0)+ifnull(num_prod_image,0)+ifnull(NUM_ELEMENT_TEXT,0)+ifnull(NUM_ELEMENT_IMAGE,0))/(total_fields) as total_content_percent_edited,
+div0(num_prod_name,total_site_items) as p_name_completion,
+div0(ifnull((num_prod_description+num_prod_image),0),ifnull((total_site_items*2),0)) as prod_comp,
+div0(ifnull((NUM_ELEMENT_TEXT+NUM_ELEMENT_IMAGE),0),ifnull((num_eltext_total+num_elim_total),0)) as elem_comp
+
+
+from site_completion_base b
+
+left join weebly_analytics.ecom_main.ecom_square_map e on b.user_id= e.user_id 
+left join WEEBLY_ML.EDITOR2.CURRENT_SITE_PIVOT p on b.CURRENT_SNAPSHOT_ID=p.SITE_SNAPSHOT_ID
+
+
+)
+
+
+select 
+updated_at,
+merchant_token,
+total_site_blocks,
+total_standard_pages,
+total_content,
+content_filled,
+completion_percentage,
+completion_rank,
+num_Elem_filled,
+num_elem_total,
+div0(num_Elem_filled,content_filled) as elem_filled_mix,
+total_content_percent_check,
+prod_comp,
+elem_comp
+from (
+select c.*, rank() over(partition by c.merchant_token order by c.UPDATED_AT desc) as activity_rank 
+        from site_completion c) 
+        where activity_rank=1
+        ;
