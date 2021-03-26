@@ -1,0 +1,359 @@
+with 
+
+
+
+montlhy_txns as (
+
+select p.merchant_token,
+  	case when is_active and ((ecom_product_name = 'sos' and (TO_CHAR(DATE_TRUNC('month', date ), 'YYYY-MM')) = (TO_CHAR(DATE_TRUNC('month', first_sos_txn_at ), 'YYYY-MM'))) 
+                             or(ecom_product_name = 'soc' and (TO_CHAR(DATE_TRUNC('month', date ), 'YYYY-MM')) = (TO_CHAR(DATE_TRUNC('month', first_soc_txn_at ), 'YYYY-MM'))))
+              then  'New_Seller'
+          when is_active and ((ecom_product_name = 'sos' and (TO_CHAR(DATE_TRUNC('month', date ), 'YYYY-MM')) = (TO_CHAR(DATE_TRUNC('month', reactivate_at ), 'YYYY-MM'))) 
+                              or(ecom_product_name = 'soc' and (TO_CHAR(DATE_TRUNC('month', date ), 'YYYY-MM')) = (TO_CHAR(DATE_TRUNC('month', reactivate_at ), 'YYYY-MM'))))
+               then 'Ractivated_Seller'
+          when is_active
+              then 'Existing_Seller'
+          else null end  AS "seller_status",
+        date_trunc(month,date) as txn_month,
+        count(distinct date) transaction_frequency_per_month,
+        COUNT(DISTINCT CASE WHEN  churn_at = date THEN p.merchant_token ELSE NULL END) AS "churned_merchants",
+        sum(GROSS_TXN_COUNT) total_monthly_transactions,
+  COALESCE(SUM(gross_gpv_usd ), 0) AS gross_gpv
+  from weebly_analytics.square_sync.ecom_daily_processing_90_day_churn p
+  where is_active ='True' 
+  and ecom_product_name = 'sos'
+group by 1,2 ,3 
+),
+
+
+
+
+montlhy_txns_updated as (
+
+select *,
+  case when churned_merchants = 0 then null else AVG(gross_gpv) OVER  ( Partition by merchant_token
+    ORDER BY txn_month
+    ROWS BETWEEN 2 PRECEDING AND current row) end as  sos_churned_gpv_3m,
+   round(avg(transaction_frequency_per_month) OVER  ( Partition by merchant_token
+    ORDER BY txn_month
+    ROWS BETWEEN 2 PRECEDING AND current row),0) as avg_transaction_frequency_per_month,
+     round(avg(total_monthly_transactions) OVER  ( Partition by merchant_token
+    ORDER BY txn_month
+    ROWS BETWEEN 2 PRECEDING AND current row),0) as avg_transactions_per_month
+from montlhy_txns 
+
+),
+
+
+
+
+avg_montlhy_txns as(
+
+select merchant_token,
+  TO_NUMBER(avg(total_monthly_transactions)) avg_monthly_lifetime_transactions
+from montlhy_txns mt
+where txn_month <= '2020-11-01'
+group by 1
+),
+
+
+
+
+
+seller_acquisition_type as (
+  select merchant_token, 
+  case when product_name in ('Square Online Store', 'On Demand Delivery', 'Seller Powered Delivery', 'Self Serve Order') then 'SOS' 
+       when product_name = 'Square Online Checkout' then 'SOC' 
+  else 'Square' end as seller_acquisition_type,
+  min( USER_FIRST_ACTIVITY_DATE) USER_FIRST_ACTIVITY_DATE
+ from (select merchant_token, product_name, USER_FIRST_ACTIVITY_DATE, rank() over(partition by merchant_token order by USER_FIRST_ACTIVITY_DATE ) as activity_rank 
+        from app_bi.app_bi_dw.dim_user_first_activity 
+        where  USER_FIRST_ACTIVITY_DATE < '9999-12-31')
+  where activity_rank = 1
+  group by 1,2
+),
+
+
+
+
+mini_site as(
+select distinct merchant_token
+from weebly_analytics.looker.site_properties sp
+inner join Weebly_analytics.ecom_main.ecom_square_map m  on sp.user_id = m.user_id
+where sp.mini_site = '1'
+),
+
+
+
+
+
+buyer_traffic_UV as (select 
+DERIVED_TSTAMP, 
+Website_owner_id,
+--case when SE_CATEGORY in ('shopping.pickup.checkout','shopping.pickup.cart') then 1 else 0 end as Checkout_count,
+domain_sessionid as traffic_count
+from weebly_data.snowplow_network.buyer_event be where DERIVED_TSTAMP >= '2020-10-01')
+
+,buyer_traffic as(
+  select 
+merchant_token,
+date_trunc('month',DERIVED_TSTAMP) date,
+count(traffic_count) as buyer_uv
+--sum(checkout_count) as buyer_checkout,
+--CASE WHEN SUM(buyer_checkout) <> 0 THEN(SUM(buyer_checkout)/SUM(buyer_uv)) ELSE 0 END as buyer_ATC,
+
+from buyer_traffic_UV be
+inner join Weebly_analytics.ecom_main.ecom_square_map m  on to_varchar(be.Website_owner_id) =to_varchar(m.user_id)
+where DERIVED_TSTAMP >= '2020-10-01'
+group by 1,2),
+
+--buyer_website_traffic as (
+--select merchant_token, date_trunc('month',DERIVED_TSTAMP) date, count(distinct domain_sessionid) traffic
+--from weebly_data.snowplow_network.buyer_event be
+--inner join Weebly_analytics.ecom_main.ecom_square_map m  on to_varchar(be.Website_owner_id) =to_varchar(m.user_id)
+--where DERIVED_TSTAMP >= '2021-01-01'
+--group by 1,2 
+--),
+
+
+
+
+
+
+count_of_locations as (
+select merchant_token, count(*) total_virtual_locations
+from weebly_data.weebly.com_store_location csl  
+inner join Weebly_analytics.ecom_main.ecom_square_map m  on to_varchar(csl.owner_id) =to_varchar(m.user_id)
+where   DELETED_AT is null 
+group by 1 
+),
+
+
+
+
+
+site_completion_scores as (
+select merchant_token, max(COMPLETION_RANK) site_completion_rank, max(total_fields) as total_content
+from WEEBLY_ML.EDITOR2.COMPLETION_SITE_DIMENSION s
+left join weebly_analytics.ecom_main.ecom_square_map e on s.user_id= e.user_id 
+group by 1 
+),
+
+
+
+
+
+
+account_managed as (
+SELECT distinct merchant_token
+    , 'account_managed' as account_type
+FROM app_merch_growth.app_merch_growth_etl.am_fact_account_ownership_v2
+WHERE is_actively_managed = 1
+),
+
+
+
+
+
+
+catalog_count as (
+select merchant_token
+
+        , count(distinct SITE_PRODUCT_ID) item_count
+        , count(distinct case when visibility = 'visible' then  SITE_PRODUCT_ID else null end ) visible_item_count
+        , count(distinct case when IMAGE_ORDER is not null and IMAGE_ORDER <> 'null'  then  SITE_PRODUCT_ID else null end ) image_item_count
+        , count(distinct case when (PRICE_HIGH is not null and PRICE_HIGH <> 0)  or (PRICE_low is not null and PRICE_low <> 0)  then  SITE_PRODUCT_ID else null end ) pricing_item_count
+        , count(distinct case when name is not null or name= '' then  SITE_PRODUCT_ID else null end ) named_item_count
+        , count(distinct case when SHORT_DESCRIPTION is not null then  SITE_PRODUCT_ID else null end ) description_item_count
+  from weebly_data.datalake_transform.com_product comp
+inner join weebly_analytics.ecom_main.ecom_square_map map on comp.owner_id = map.user_id  
+group by 1 
+),
+
+
+
+
+
+
+ fullfillment as(
+select distinct merchant_token,
+   PICKUP_ENABLED,
+   CURBSIDE_PICKUP_ENABLED,
+   DELIVERY_ENABLED,
+   DINE_IN_ENABLED
+from weebly_data.weebly.com_store_location csl 
+  left join weebly_analytics.ecom_main.ecom_square_map map on csl.owner_id = map.user_id
+   group by 1,2,3,4,5
+),
+
+
+
+
+
+
+ --difm as(
+--SELECT  merchant_token
+ --   , 1 difm_associated
+ --   , MAX(d.BUSINESS_NAME) difm_associated_business
+ --   , CASE WHEN difm_associated_business in ('99designs') THEN '99designs_testaccount'
+ --     WHEN difm_associated_business IN ('Bear Branded', 'Bogdan Barna', 'Elysic Solutions', 'Skinnycarrot', 'WaelSadek', 'deandesign', 'kbertarione', 'webmajstor', 'Milo Coffee House', 'Bas Hasibuan', 'FusionTrek', 'Headmade Studio', 'Logicsoft Technologies', 'Micheal Hanly', 'webcomet', 'Webcomet', 'Nishant', 'Genome Design Agency', 'Antonio Castello Viusal Art', 'Lightwave', 'AbdooElhamdaoui', 'panonis', 'Nicolette Leigh Creative', 'tinfinity', 'zana', 'gegen', 'lantonx', 'ABRIR','Insphic')
+ --     THEN '99designs'
+ --     ELSE difm_associated_business END agency -- this agency field is added by Partnerships POPS team (jamiey@) as we currently do not have a dynamic mapping of designers to agencies
+ -- FROM WEEBLY_DATA.PHOENIX.SQUARE_CLIENT sc
+ -- left join weebly_analytics.ecom_main.ecom_square_map map on sc.WEEBLY_USER_ID = map.user_id
+ --   LEFT OUTER JOIN WEEBLY_DATA.PHOENIX.DESIGNER d
+ --   ON sc.DESIGNER_ID = d.ID
+ -- WHERE sc.AUTHORIZED_AT IS NOT NULL
+ -- GROUP BY  1,2
+ --  ),
+   
+
+
+
+
+   RTS as (
+   select *  from
+  (select  log_date,user_id, ready_to_sell, ready_to_sell_composite,
+  case when sum((pickup_jtbd)+(delivery_jtbd)+(dinein_jtbd)+(nonphysical_jtbd)+(shipping_jtbd))>0 then 1 else 0 end as rts_intent,
+      
+      row_number() over (partition by rts.user_id order by log_date desc) as rn
+   from WEEBLY_ANALYTICS.COMMERCE.RTS rts 
+  
+   group by 1,2,3,4
+            order by USER_ID, Log_date)
+     
+  where rn = 1), rts_a as
+  (select  merchant_token ,READY_TO_SELL, rts.READY_TO_SELL_COMPOSITE,RTS_INTENT
+from RTS
+
+left join weebly_analytics.ecom_main.ecom_square_map e on rts.user_id = e.user_id ),
+
+
+
+
+
+total_reachable_contacts as (
+   select distinct
+    pa.merchant_token
+  , pa.merchant_activity_status
+  , dc.total_contacts
+  , case when dc.total_reachable_contacts <=10 then '1_10'
+        when dc.total_reachable_contacts between 11 and 20 then '11_20'
+        when dc.total_reachable_contacts  between 21 and 50 then '21_50'
+        when dc.total_reachable_contacts  between 51 and 100 then '51_100'
+        when dc.total_reachable_contacts  between 101 and 500 then '101-500'
+        when dc.total_reachable_contacts  between 501 and 1000 then '501_1000'
+        when dc.total_reachable_contacts  between 501 and 1000 then '501_1000'
+        when dc.total_reachable_contacts  between 1001 and 5000 then '1001_5000'
+  when dc.total_reachable_contacts  between 5001 and 10000 then '5001_10000'
+        when dc.total_reachable_contacts >10000 then '10000>'else null end as total_reachable_contacts
+from app_bi.app_bi_dw.dim_merchant_product_activity pa
+inner join app_pa.app_customers_pro.directory_contact_counts dc
+  on pa.merchant_token = dc.best_available_merchant_token
+where pa.product_name = 'Square Online Store'
+  --and pa.product_category = 'SaaS'
+  and current_date() between pa.effective_begin and pa.effective_end
+order by dc.total_contacts desc)
+
+
+-- output--
+
+select TXN_MONTH,
+ case when avg_monthly_lifetime_transactions < 5 then '1_5'--to_varchar(avg_transaction_frequency_per_month)
+            when avg_monthly_lifetime_transactions  between 5 and 10 then '5_10'
+            when avg_monthly_lifetime_transactions  between 11 and 15 then '11_15'
+            when avg_monthly_lifetime_transactions > 15 then '15&above'
+            else null end as avg_monthly_lifetime_transactions,
+    case when avg_transaction_frequency_per_month < 5 then '1_5'--to_varchar(avg_transaction_frequency_per_month)
+            when avg_transaction_frequency_per_month  between 5 and 10 then '5_10'
+            when avg_transaction_frequency_per_month  between 11 and 15 then '11_15'
+            when avg_transaction_frequency_per_month > 15 then '15above'
+            else null end as avg_transaction_frequency_per_month,
+//   case when avg_transactions_per_month < 5 then '1-5'--to_varchar(avg_transactions_per_month)
+//            when avg_transactions_per_month  between 5 and 10 then '5_10'
+//            when avg_transactions_per_month  between 11 and 15 then '11_15'
+//            when avg_transactions_per_month > 15 then '15above'
+//            else null end as avg_transactions_per_month,
+case when ms.merchant_token is not null then 'mini_site' else 'multi_page_site' end as minisite,
+case when buyer_uv  between 1 and 10 then '1_10'--to_varchar(avg_transaction_frequency_per_month
+     when buyer_uv  between 11 and 50 then '11_50'
+     when buyer_uv  between 51 and 100 then '51_100'
+     when buyer_uv > 100 then '100above'
+     else null end as buyer_uv,
+case when total_virtual_locations <= 3 then to_varchar(total_virtual_locations)
+     when total_virtual_locations > 3 then '3above'
+     else null end as total_virtual_locations,
+site_completion_rank,
+case when total_content  between  1 and 50 then '1_50'--to_varchar(avg_transaction_frequency_per_month
+     when total_content  between 51 and 100 then '51_100'
+     when total_content  between 101 and 200 then '1001_200'
+     when total_content  between 201 and 500 then '201_500'
+     when total_content > 500 then '500above'
+     else null end as total_content,
+case when am.merchant_token is not null then 'account_managed' else 'non_account_managed' end as account_managed,
+case when visible_item_count < 5 then 'less_than_5'--to_varchar(avg_transaction_frequency_per_month)
+            when visible_item_count  between 5 and 10 then 'five_10'
+            when visible_item_count  between 11 and 20 then '11_20'
+            when visible_item_count > 20 then '20above'
+            else null end as item_count,
+total_reachable_contacts,
+//case when image_item_count = 0 then '0'
+//            when image_item_count between 1 and 5 then '1_5'--to_varchar(avg_transaction_frequency_per_month)
+//            when image_item_count  between 6 and 10 then '5_10'
+//            when image_item_count  between 11 and 20 then '11_20'
+//            when image_item_count > 20 then '20Above'
+//            else null end as image_item_count,
+//case when pricing_item_count = 0 then '0'
+//            when pricing_item_count between 1 and 5 then '1_5'--to_varchar(avg_transaction_frequency_per_month)
+//            when pricing_item_count  between 6 and 10 then '6_10'
+//            when pricing_item_count  between 11 and 20 then '11_20'
+//            when pricing_item_count > 20 then '20Above'
+//            else null end as pricing_item_count,
+//case when named_item_count = 0 then '0' 
+//    when named_item_count <= 5 then '1_5'--to_varchar(avg_transaction_frequency_per_month)
+//            when named_item_count  between 6 and 10 then '6_10'
+//            when named_item_count  between 11 and 20 then '11_20'
+//            when named_item_count > 20 then '20Above'
+//            else null end as named_item_count,
+//case when description_item_count < 5 then 'less_than_5'--to_varchar(avg_transaction_frequency_per_month)
+//            when description_item_count  between 5 and 10 then 'five_10'
+//            when description_item_count  between 10 and 20 then '10_20'
+//            when description_item_count > 20 then '20Above'
+//            else null end as description_item_count,
+//   PICKUP_ENABLED,
+//   CURBSIDE_PICKUP_ENABLED,
+//   DELIVERY_ENABLED,
+//   DINE_IN_ENABLED,
+--case when difm.merchant_token is not null then 'DIFM' else 'non_DIFM' end as DIFM,
+  seller_status, 
+  business_category,
+  case when business_category in ('retail', 'food_and_drink', 'charities_education_and_membership') then business_type else 'other' end as business_type,
+  country,
+  seller_acquisition_type,
+  ECOM_SQUARE_PROSPECT_CATEGORY,
+  ECOM_SQUARE_ACQUISITION_CATEGORY,
+  merchant_sub_segment,
+  READY_TO_SELL,
+  READY_TO_SELL_COMPOSITE,
+  RTS_INTENT,
+  count(distinct mt.merchant_token) active_sellers,
+  sum(churned_merchants) churned_sellers,
+  sum(gross_gpv)  gross_gpv,
+  sum(sos_churned_gpv_3m ) as sos_churned_gpv_3m_avg
+from montlhy_txns_updated mt
+left join weebly_analytics.square_sync.ecom_square_kpi_all kpi on mt.merchant_token = kpi.merchant_token
+left join  avg_montlhy_txns mtl on mt.merchant_token = mtl.merchant_token
+left join mini_site ms on mt.merchant_token = ms.merchant_token
+left join (select merchant_token , TO_NUMBER(avg(buyer_uv)) buyer_uv from buyer_traffic group by 1) wt on mt.merchant_token = wt.merchant_token
+left join count_of_locations cl on mt.merchant_token = cl.merchant_token
+left join seller_acquisition_type sat on mt.merchant_token = sat.merchant_token
+left join site_completion_scores scs on mt.merchant_token = scs.merchant_token
+left join account_managed am on mt.merchant_token = am.merchant_token
+left join catalog_count cc on mt.merchant_token = cc.merchant_token
+left join fullfillment f on mt.merchant_token = f.merchant_token
+--left join difm  on mt.merchant_token = difm.merchant_token
+left join total_reachable_contacts trc on mt.merchant_token = trc.merchant_token
+
+left join RTS_A r on mt.merchant_token = r.merchant_token
+where TXN_MONTH between '2020-10-01' and '2020-10-01' 
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22
